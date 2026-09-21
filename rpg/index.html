@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>星语村物语 · CodeM RPG 交互演示</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #10131a; color: #e8e6df;
+    font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif; }
+  #wrap { min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 10px; }
+  canvas { background: #000; border: 1px solid #2c3140; border-radius: 6px;
+    image-rendering: pixelated; box-shadow: 0 8px 40px rgba(0, 0, 0, .6); }
+  #hint { font-size: 13px; color: #8b93a7; user-select: none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="800" height="600"></canvas>
+  <div id="hint">WASD / 方向键 移动 · E / 回车 交互 · Q / M 任务面板 · Esc 关闭面板</div>
+</div>
+<script>
+'use strict';
+/* =====================================================================
+ * 星语村物语 —— 经典 JRPG 风格可交互演示
+ * Meego 工作项 7378646084「codem交互演示」交付物（项目 6a8bfb890a7cfe0a9203a329）
+ * 技术方案：单文件 HTML + 原生 JS + Canvas 2D，无外部依赖
+ * 模块：GameLoop / SceneManager / TileMap / Player / InputController
+ *       DialogManager / QuestManager(事件总线) / HUD
+ * 全局状态机严格限定：TITLE / EXPLORE / DIALOG / MENU
+ * ===================================================================== */
+
+/* ---------------- 常量 ---------------- */
+const TILE = 32, MAP_W = 40, MAP_H = 30;
+const VIEW_W = 800, VIEW_H = 600;
+const T = { GRASS: 0, ROAD: 1, OBSTACLE: 2, WATER: 3 };   // 瓦片枚举
+const QS = { LOCKED: 0, AVAILABLE: 1, ACTIVE: 2, DONE: 3 }; // 任务状态
+const QS_LABEL = { 0: '未解锁', 1: '可接取', 2: '进行中', 3: '已完成' };
+const QS_COLOR  = { 0: '#7d8597', 1: '#f5c451', 2: '#5ab0f0', 3: '#5fce7d' };
+const SAVE_KEY = 'codem-rpg-7378646084-save';
+
+/* 确定性伪随机（保证地图装饰每次一致） */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------------- 事件总线 ---------------- */
+const Bus = {
+  _subs: {},
+  on(type, fn) { (this._subs[type] = this._subs[type] || []).push(fn); },
+  emit(type, payload) {
+    const list = this._subs[type];
+    if (list) for (const fn of list.slice()) fn(payload);
+  }
+};
+
+/* ---------------- 瓦片地图 ---------------- */
+const TileMap = {
+  grid: [],
+  init() { this.grid = buildMap(); },
+  tileAt(c, r) {
+    if (c < 0 || r < 0 || c >= MAP_W || r >= MAP_H) return T.OBSTACLE;
+    return this.grid[r][c];
+  },
+  isWalkable(c, r) {
+    const t = this.tileAt(c, r);
+    return t !== T.OBSTACLE && t !== T.WATER;   // 障碍与水域不可通行
+  }
+};
+
+function buildMap() {
+  const g = [];
+  for (let r = 0; r < MAP_H; r++) {
+    const row = [];
+    for (let c = 0; c < MAP_W; c++) row.push(T.GRASS);
+    g.push(row);
+  }
+  // 1) 边界树林（两圈）
+  for (let r = 0; r < MAP_H; r++) for (let c = 0; c < MAP_W; c++) {
+    if (r < 2 || r >= MAP_H - 2 || c < 2 || c >= MAP_W - 2) g[r][c] = T.OBSTACLE;
+  }
+  // 2) 主干道：横街（12-13 行）+ 竖路（19-20 列）
+  for (let c = 2; c < MAP_W - 2; c++) { g[12][c] = T.ROAD; g[13][c] = T.ROAD; }
+  for (let r = 2; r < MAP_H - 2; r++) { g[r][19] = T.ROAD; g[r][20] = T.ROAD; }
+  // 3) 村长家（14-24 列，4-6 行，障碍块 + 底部大门）
+  for (let r = 4; r <= 6; r++) for (let c = 14; c <= 24; c++) g[r][c] = T.OBSTACLE;
+  g[6][19] = T.ROAD; g[6][20] = T.ROAD; // 大门
+  // 4) 池塘（27-33 列，3-9 行，圆角）
+  for (let r = 3; r <= 9; r++) for (let c = 27; c <= 33; c++) {
+    const corner = (r === 3 || r === 9) && (c === 27 || c === 33);
+    if (!corner) g[r][c] = T.WATER;
+  }
+  // 5) 随机装饰树（确定性种子，避开关键区域）
+  const rnd = mulberry32(20260921);
+  const near = (c, r, cc, rr, rad) => Math.abs(c - cc) <= rad && Math.abs(r - rr) <= rad;
+  for (let i = 0; i < 70; i++) {
+    const c = 3 + Math.floor(rnd() * (MAP_W - 6));
+    const r = 3 + Math.floor(rnd() * (MAP_H - 6));
+    if (g[r][c] !== T.GRASS) continue;
+    if (r === 11 || r === 14) continue;                        // 紧邻主街留白
+    if (c === 18 || c === 21) continue;                        // 紧邻竖路留白
+    if (near(c, r, 20, 18, 2)) continue;                       // 玩家出生点
+    if (near(c, r, 19, 10, 1)) continue;                       // 村长
+    if (near(c, r, 13, 14, 1)) continue;                       // 小芳
+    if (near(c, r, 30, 11, 2)) continue;                       // 项链区域
+    g[r][c] = T.OBSTACLE;
+  }
+  // 6) 项链旁的大树（剧情点缀：湖边树下）
+  g[11][32] = T.OBSTACLE;
+  return g;
+}
+
+/* ---------------- NPC 与道具 ---------------- */
+const NPCS = [
+  { id: 'chief',    name: '村长', col: 19, row: 10, color: '#8d3b3b', seed: 1.7 },
+  { id: 'villager', name: '小芳', col: 13, row: 14, color: '#b5658f', seed: 3.1 }
+];
+for (const n of NPCS) { n.x = n.col * TILE + TILE / 2; n.y = n.row * TILE + TILE / 2; }
+
+const ITEMS = [
+  { id: 'necklace', name: '银之项链', col: 30, row: 11, taken: false }
+];
+for (const it of ITEMS) { it.x = it.col * TILE + TILE / 2; it.y = it.row * TILE + TILE / 2; }
+function itemVisible(it) { return !it.taken && QM.state('q_find_item') === QS.ACTIVE; }
+
+/* ---------------- 任务系统 ---------------- */
+const QUESTS = [
+  { id: 'q_talk_chief', name: '与村长对话', prev: null,
+    desc: '去村子中央找村长聊聊吧', goal: { type: 'talk', target: 'chief' } },
+  { id: 'q_find_item',  name: '寻找丢失道具', prev: 'q_talk_chief',
+    desc: '帮村长找回丢失的银之项链（东边湖边树下）', goal: { type: 'pickup', target: 'necklace' } },
+  { id: 'q_deliver',    name: '回报交付', prev: 'q_find_item',
+    desc: '把银之项链交还给村长', goal: { type: 'talk', target: 'chief' } }
+];
+
+const QM = {
+  states: {},
+  init() {
+    for (const q of QUESTS) this.states[q.id] = q.prev ? QS.LOCKED : QS.AVAILABLE;
+  },
+  state(id) { return this.states[id]; },
+  quest(id) { return QUESTS.find(q => q.id === id); },
+  accept(id) {
+    if (this.states[id] !== QS.AVAILABLE) return;
+    this.states[id] = QS.ACTIVE;
+    HUD.toast(`任务已接取：${this.quest(id).name}`);
+    Bus.emit('quest:changed', id);
+  },
+  complete(id) {
+    if (this.states[id] !== QS.ACTIVE) return;
+    this.states[id] = QS.DONE;
+    HUD.toast(`任务完成：${this.quest(id).name}`);
+    for (const q of QUESTS) {
+      if (q.prev === id && this.states[q.id] === QS.LOCKED) {
+        this.states[q.id] = QS.AVAILABLE;
+        HUD.toast(`新任务可接取：${q.name}`);
+      }
+    }
+    Bus.emit('quest:changed', id);
+    if (QUESTS.every(q => this.states[q.id] === QS.DONE)) Bus.emit('game:clear');
+  },
+  snapshot() { return Object.assign({}, this.states); },
+  restore(s) { if (s) for (const k of Object.keys(s)) if (k in this.states) this.states[k] = s[k]; },
+  reset() { this.init(); }
+};
+
+/* quest:accept:<id> / quest:complete:<id> 事件驱动 */
+function bindQuestEvents() {
+  for (const q of QUESTS) {
+    Bus.on(`quest:accept:${q.id}`,   () => QM.accept(q.id));
+    Bus.on(`quest:complete:${q.id}`, () => QM.complete(q.id));
+  }
+  Bus.on('quest:changed', () => Game.save());
+  Bus.on('game:clear', () => { HUD.clearShown = true; Game.save(); });
+}
+
+/* ---------------- 对话数据（声明式） ---------------- */
+const DIALOGS = {
+  /* 村长：初次见面（完成 q1，提供 q2 委托） */
+  chief_intro: {
+    name: '村长',
+    openEvent: ['quest:accept:q_talk_chief', 'quest:complete:q_talk_chief'],
+    lines: [
+      '村长：哦？好多年没有外乡人来星语村了。欢迎，旅行者！',
+      '村长：实不相瞒，我有件烦心事——我祖传的银之项链不见了。',
+      '村长：听说有人最后在东边湖边见过亮闪闪的东西……能帮我找找吗？'
+    ],
+    choices: [
+      { text: '接受委托', next: 'chief_accept', event: 'quest:accept:q_find_item' },
+      { text: '我考虑一下', next: null }
+    ]
+  },
+  /* 村长：委托尚未接取（再次到访） */
+  chief_quest_offer: {
+    name: '村长',
+    lines: [
+      '村长：旅行者，改变主意了吗？',
+      '村长：那条银之项链对我真的很重要……就在东边湖边一带。'
+    ],
+    choices: [
+      { text: '接受委托', next: 'chief_accept', event: 'quest:accept:q_find_item' },
+      { text: '我考虑一下', next: null }
+    ]
+  },
+  /* 村长：接受委托后 */
+  chief_accept: {
+    name: '村长',
+    lines: [
+      '村长：太好了！项链是银色的，坠着一颗小星星。',
+      '村长：湖边那棵大树下……我记得没错的话。拜托了！'
+    ]
+  },
+  /* 村长：任务进行中 */
+  chief_waiting: {
+    name: '村长',
+    lines: [
+      '村长：还没找到吗？别灰心。',
+      '村长：提示你一下——东边湖边，那棵大树的下面。'
+    ]
+  },
+  /* 村长：交付（接取并完成 q3） */
+  chief_deliver_offer: {
+    name: '村长',
+    lines: [
+      '村长：哦！你手里那是——！',
+      '村长：是我的银之项链！小星星坠子还在，真是太好了！'
+    ],
+    choices: [
+      { text: '交还银之项链', next: 'chief_thanks', event: 'quest:accept:q_deliver' },
+      { text: '以后再说', next: null }
+    ]
+  },
+  /* 村长：致谢（对话结束完成 q3 → 通关） */
+  chief_thanks: {
+    name: '村长',
+    lines: [
+      '村长：……谢谢你，旅行者。',
+      '村长：星语村的大门永远为你敞开！',
+    ],
+    endEvent: 'quest:complete:q_deliver'
+  },
+  /* 村长：通关后闲聊 */
+  chief_after: {
+    name: '村长',
+    lines: [
+      '村长：村子又恢复了平静，这都是你的功劳。',
+      '村长：有空常来坐坐啊，旅行者。'
+    ]
+  },
+  /* 小芳 */
+  fang_hint: {
+    name: '小芳',
+    lines: [
+      '小芳：你在找项链呀？',
+      '小芳：我前两天在东边湖边乘凉，好像看到大树下面有东西在闪闪发光……'
+    ]
+  },
+  fang_go: {
+    name: '小芳',
+    lines: [ '小芳：快去把项链还给村长吧，他都急坏了！' ]
+  },
+  fang_idle: {
+    name: '小芳',
+    lines: [ '小芳：今天天气真好呀，湖水蓝得发亮。' ]
+  }
+};
+
+/* 按任务状态分派 NPC 对话 id */
+function dialogForNpc(npc) {
+  if (npc.id === 'chief') {
+    const s2 = QM.state('q_find_item');
+    if (s2 === QS.AVAILABLE) return QM.state('q_talk_chief') === QS.DONE
+      ? 'chief_quest_offer' : 'chief_intro';
+    if (s2 === QS.ACTIVE) return 'chief_waiting';
+    if (s2 === QS.DONE) {
+      const s3 = QM.state('q_deliver');
+      if (s3 === QS.AVAILABLE) return 'chief_deliver_offer';
+      if (s3 === QS.DONE) return 'chief_after';
+    }
+    return 'chief_intro';
+  }
+  if (npc.id === 'villager') {
+    if (QM.state('q_find_item') === QS.ACTIVE) return 'fang_hint';
+    if (QM.state('q_deliver') === QS.AVAILABLE) return 'fang_go';
+    return 'fang_idle';
+  }
+  return 'fang_idle';
+}
+
+/* ---------------- 输入控制器 ---------------- */
+const Input = {
+  keys: new Set(),
+  axis() {
+    let dx = 0, dy = 0;
+    if (this.keys.has('left')) dx -= 1;
+    if (this.keys.has('right')) dx += 1;
+    if (this.keys.has('up')) dy -= 1;
+    if (this.keys.has('down')) dy += 1;
+    return { dx, dy };
+  }
+};
+function normKey(e) {
+  const k = e.key;
+  if (k === 'ArrowLeft'  || k === 'a' || k === 'A') return 'left';
+  if (k === 'ArrowRight' || k === 'd' || k === 'D') return 'right';
+  if (k === 'ArrowUp'    || k === 'w' || k === 'W') return 'up';
+  if (k === 'ArrowDown'  || k === 's' || k === 'S') return 'down';
+  return k;
+}
+
+/* ---------------- 玩家 ---------------- */
+const Player = {
+  x: 20 * TILE + 16, y: 18 * TILE + 16,
+  facing: 'down', speed: 140, anim: 0, moving: false,
+  halfW: 10, halfH: 7,   // 脚部碰撞盒（小于一格，手感更好）
+  reset() { this.x = 20 * TILE + 16; this.y = 18 * TILE + 16; this.facing = 'down'; },
+  update(dt) {
+    const { dx, dy } = Input.axis();
+    this.moving = dx !== 0 || dy !== 0;
+    if (this.moving) {
+      this.facing = dx !== 0 ? (dx > 0 ? 'right' : 'left')
+                             : (dy > 0 ? 'down' : 'up');
+      const len = Math.hypot(dx, dy) || 1;
+      const vx = dx / len * this.speed * dt / 1000;
+      const vy = dy / len * this.speed * dt / 1000;
+      this.tryMove(vx, vy);
+      this.anim += dt / 100;
+    } else {
+      this.anim = 0;
+    }
+  },
+  tryMove(dx, dy) {
+    if (dx) { const nx = this.x + dx; if (!this.collides(nx, this.y)) this.x = nx; }
+    if (dy) { const ny = this.y + dy; if (!this.collides(this.x, ny)) this.y = ny; }
+  },
+  collides(px, py) {
+    const pts = [
+      [px - this.halfW, py - this.halfH], [px + this.halfW, py - this.halfH],
+      [px - this.halfW, py + this.halfH], [px + this.halfW, py + this.halfH]
+    ];
+    for (const [x, y] of pts) {
+      if (!TileMap.isWalkable(Math.floor(x / TILE), Math.floor(y / TILE))) return true;
+    }
+    for (const n of NPCS) {   // NPC 也是实体碰撞
+      if (Math.abs(px - n.x) < this.halfW + 11 && Math.abs(py - n.y) < this.halfH + 9) return true;
+    }
+    return false;
+  }
+};
+
+/* 面向判定：距离够近且朝向大致指向目标 */
+function canInteractWith(tx, ty) {
+  const dx = tx - Player.x, dy = ty - Player.y;
+  const d = Math.hypot(dx, dy);
+  if (d > 52) return false;
+  if (d < 14) return true;
+  const f = Player.facing;
+  const fx = f === 'left' ? -1 : f === 'right' ? 1 : 0;
+  const fy = f === 'up' ? -1 : f === 'down' ? 1 : 0;
+  return (dx * fx + dy * fy) / d > 0.35;
+}
+function nearestInteractable() {
+  for (const it of ITEMS) {
+    if (itemVisible(it) && canInteractWith(it.x, it.y)) return { type: 'item', obj: it };
+  }
+  for (const n of NPCS) {
+    if (canInteractWith(n.x, n.y)) return { type: 'npc', obj: n };
+  }
+  return null;
+}
+
+/* ---------------- 对话框管理器 ---------------- */
+const DM = {
+  active: false, def: null, page: 0, chars: 0, selecting: false, sel: 0,
+  CHAR_MS: 28,
+  open(id) {
+    this.def = DIALOGS[id];
+    if (!this.def) return;
+    this.active = true; this.page = 0; this.chars = 0; this.selecting = false; this.sel = 0;
+    SM.set('DIALOG');
+    if (this.def.openEvent) {
+      const evs = Array.isArray(this.def.openEvent) ? this.def.openEvent : [this.def.openEvent];
+      for (const ev of evs) Bus.emit(ev);
+    }
+  },
+  close() {
+    this.active = false;
+    const ev = this.def && this.def.endEvent;
+    this.def = null;
+    if (ev) Bus.emit(ev);
+    SM.set('EXPLORE');
+    Game.save();
+  },
+  curLine() { return this.def ? this.def.lines[this.page] : ''; },
+  update(dt) {
+    if (!this.active) return;
+    const len = [...this.curLine()].length;
+    if (this.chars < len) this.chars = Math.min(len, this.chars + dt / this.CHAR_MS);
+  },
+  onConfirmKey() {
+    if (!this.active) return;
+    const len = [...this.curLine()].length;
+    if (this.chars < len) { this.chars = len; return; }      // 跳过打字机
+    if (this.page < this.def.lines.length - 1) {             // 下一页
+      this.page++; this.chars = 0; this.selecting = false; return;
+    }
+    if (this.def.choices && this.def.choices.length) {        // 末页 → 显示选项
+      this.selecting = true; return;
+    }
+    this.close();                                            // 无选项 → 结束
+  },
+  moveSel(d) {
+    if (!this.active || !this.selecting) return;
+    const n = this.def.choices.length;
+    this.sel = (this.sel + d + n) % n;
+  },
+  choose(i) {
+    if (!this.active || !this.selecting) return;
+    const ch = this.def.choices[i];
+    if (!ch) return;
+    if (ch.event) Bus.emit(ch.event);
+    if (ch.next) this.open(ch.next);
+    else this.close();
+  }
+};
+
+/* ---------------- 摄像机 ---------------- */
+const Camera = {
+  x: 0, y: 0,
+  update(dt) {
+    const tx = clamp(Player.x - VIEW_W / 2, 0, MAP_W * TILE - VIEW_W);
+    const ty = clamp(Player.y - VIEW_H / 2, 0, MAP_H * TILE - VIEW_H);
+    const f = 1 - Math.pow(0.85, dt / 16.7);   // 平滑插值（帧率无关）
+    this.x += (tx - this.x) * f;
+    this.y += (ty - this.y) * f;
+  },
+  snap() {
+    this.x = clamp(Player.x - VIEW_W / 2, 0, MAP_W * TILE - VIEW_W);
+    this.y = clamp(Player.y - VIEW_H / 2, 0, MAP_H * TILE - VIEW_H);
+  }
+};
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+/* ---------------- HUD ---------------- */
+const HUD = {
+  toasts: [], clearShown: false,
+  toast(text) { this.toasts.push({ text, t: 3000 }); if (this.toasts.length > 3) this.toasts.shift(); },
+  update(dt) {
+    for (const s of this.toasts) s.t -= dt;
+    this.toasts = this.toasts.filter(s => s.t > 0);
+  },
+  objective() {
+    for (const q of QUESTS) {
+      const s = QM.state(q.id);
+      if (s === QS.AVAILABLE) return `新任务可接取：${q.name}`;
+      if (s === QS.ACTIVE) return `当前目标：${q.desc}`;
+    }
+    return '任务链完成！';
+  }
+};
+
+/* ---------------- 场景管理器（全局状态机，严格 4 态） ---------------- */
+const SM = {
+  state: 'TITLE',
+  set(s) {
+    if (!['TITLE', 'EXPLORE', 'DIALOG', 'MENU'].includes(s)) return;
+    this.state = s;
+  },
+  startGame() {
+    this.set('EXPLORE');
+    Camera.snap();
+    HUD.toast('欢迎来到星语村！');
+  }
+};
+
+/* ---------------- 交互入口 ---------------- */
+function tryInteract() {
+  const hit = nearestInteractable();
+  if (!hit) return;
+  if (hit.type === 'item') {
+    hit.obj.taken = true;
+    HUD.toast(`获得道具：${hit.obj.name}`);
+    Bus.emit('quest:complete:q_find_item');
+    Game.save();
+    return;
+  }
+  DM.open(dialogForNpc(hit.obj));
+}
+function resetProgress() {
+  try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* 忽略 */ }
+  QM.reset();
+  for (const it of ITEMS) it.taken = false;
+  Player.reset();
+  Camera.snap();
+  HUD.clearShown = false;
+  HUD.toasts = [];
+  HUD.toast('进度已重置');
+  SM.set('EXPLORE');
+}
+
+/* ---------------- 存档（可选能力：localStorage） ---------------- */
+const Game = {
+  last: 0, time: 0, saveTimer: 0, started: false,
+  save() {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        q: QM.snapshot(),
+        items: ITEMS.map(i => !!i.taken),
+        p: { x: Math.round(Player.x), y: Math.round(Player.y) },
+        cleared: !!HUD.clearShown
+      }));
+    } catch (e) { /* 隐私模式等场景忽略 */ }
+  },
+  load() {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return false;
+      const d = JSON.parse(raw);
+      QM.restore(d.q);
+      if (Array.isArray(d.items)) d.items.forEach((v, i) => { if (ITEMS[i]) ITEMS[i].taken = !!v; });
+      if (d.p && typeof d.p.x === 'number') { Player.x = d.p.x; Player.y = d.p.y; }
+      HUD.clearShown = !!d.cleared;
+      return true;
+    } catch (e) { return false; }
+  },
+  hasSave() {
+    try { return !!localStorage.getItem(SAVE_KEY); } catch (e) { return false; }
+  }
+};
+
+/* ---------------- 键盘路由 ---------------- */
+function onKeyDown(e) {
+  const dir = normKey(e);
+  if (['left', 'right', 'up', 'down', ' '].includes(e.key)) e.preventDefault();
+  Input.keys.add(dir);
+  switch (SM.state) {
+    case 'TITLE':
+      if (dir === 'r' || dir === 'R') { resetProgress(); SM.startGame(); return; }
+      SM.startGame();
+      return;
+    case 'EXPLORE':
+      if (HUD.clearShown && (e.key === 'Escape')) { HUD.clearShown = false; return; }
+      if (dir === 'e' || dir === 'E' || e.key === 'Enter') tryInteract();
+      if (dir === 'q' || dir === 'Q' || dir === 'm' || dir === 'M') SM.set('MENU');
+      return;
+    case 'DIALOG':
+      if (e.key === 'Enter' || e.key === ' ' || dir === 'e' || dir === 'E') {
+        if (DM.selecting) DM.choose(DM.sel); else DM.onConfirmKey();
+      } else if (dir === 'up' || dir === 'down') {
+        DM.moveSel(dir === 'up' ? -1 : 1);
+      } else if (/^[1-9]$/.test(e.key) && DM.selecting) {
+        DM.choose(Number(e.key) - 1);
+      }
+      return;
+    case 'MENU':
+      if (dir === 'q' || dir === 'Q' || dir === 'm' || dir === 'M' || e.key === 'Escape') SM.set('EXPLORE');
+      if (dir === 'r' || dir === 'R') resetProgress();
+      return;
+  }
+}
+function onKeyUp(e) { Input.keys.delete(normKey(e)); }
+
+/* =====================================================================
+ * 渲染
+ * ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const FONT = '"PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif';
+
+function hash2(c, r) { let h = (c * 374761393 + r * 668265263) | 0; h = (h ^ (h >> 13)) * 1274126177; return ((h ^ (h >> 16)) >>> 0) / 4294967296; }
+
+/* --- 瓦片绘制（程序化，无版权素材） --- */
+function drawTile(c, r, t, time) {
+  const x = c * TILE, y = r * TILE, h = hash2(c, r);
+  if (t === T.GRASS) {
+    ctx.fillStyle = h < 0.5 ? '#3e8948' : '#41914c';
+    ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#357940';
+    if (h < 0.33) { ctx.fillRect(x + 4 + h * 8, y + 6 + h * 10, 3, 3); ctx.fillRect(x + 20, y + 22, 2, 2); }
+  } else if (t === T.ROAD) {
+    ctx.fillStyle = h < 0.5 ? '#c9a36b' : '#c5a068';
+    ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#b8945e';
+    if (h < 0.4) ctx.fillRect(x + 6 + h * 16, y + 8 + h * 12, 4, 3);
+    if (h > 0.8) ctx.fillRect(x + 18, y + 16, 3, 3);
+  } else if (t === T.WATER) {
+    ctx.fillStyle = '#2f6db5';
+    ctx.fillRect(x, y, TILE, TILE);
+    const w = Math.sin(time / 700 + h * 6.28);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(x + 4, y + 10 + w * 3, 14, 2);
+    ctx.fillRect(x + 16, y + 22 - w * 3, 10, 2);
+  } else if (t === T.OBSTACLE) {
+    // 村长家（14-24 列，4-6 行）特殊绘制为房屋
+    if (c >= 14 && c <= 24 && r >= 4 && r <= 6) { drawHouseTile(c, r, x, y); return; }
+    if (h < 0.5) { // 树
+      ctx.fillStyle = '#3e8948'; ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#7a4a21'; ctx.fillRect(x + 13, y + 18, 6, 12);
+      ctx.fillStyle = '#1e6f3e';
+      ctx.beginPath(); ctx.arc(x + 16, y + 13, 11, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#2f9e57';
+      ctx.beginPath(); ctx.arc(x + 13, y + 11, 6, 0, Math.PI * 2); ctx.fill();
+    } else { // 石头
+      ctx.fillStyle = '#3e8948'; ctx.fillRect(x, y, TILE, TILE);
+      ctx.fillStyle = '#8a8f98';
+      ctx.beginPath(); ctx.ellipse(x + 16, y + 20, 11, 8, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#a8adb6';
+      ctx.beginPath(); ctx.ellipse(x + 14, y + 17, 6, 4, 0, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+function drawHouseTile(c, r, x, y) {
+  if (r <= 5) {           // 屋顶
+    ctx.fillStyle = (c + r) % 2 ? '#a03e3e' : '#8d3636';
+    ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#7a2e2e'; ctx.fillRect(x, y + TILE - 4, TILE, 4);
+  } else {                // 墙 / 门
+    const isDoor = c === 19 || c === 20;
+    ctx.fillStyle = '#d9c39a'; ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#c4ad83'; ctx.fillRect(x, y + TILE - 3, TILE, 3);
+    if (isDoor) { ctx.fillStyle = '#4a3320'; ctx.fillRect(x + 3, y + 2, TILE - 6, TILE - 2); }
+    else { ctx.fillStyle = '#6b5136'; ctx.fillRect(x + 8, y + 10, 6, 8); ctx.fillRect(x + 19, y + 10, 6, 8); }
+  }
+}
+
+/* --- 角色（程序化像素小人） --- */
+function drawActor(a, isPlayer, time) {
+  const bob = a.moving ? Math.sin(a.anim * 6) * 2 : (isPlayer ? 0 : Math.sin(time / 500 + a.seed) * 1.5);
+  const x = a.x, y = a.y + bob;
+  // 影子
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(a.x, a.y + 14, 10, 4, 0, 0, Math.PI * 2); ctx.fill();
+  // 腿（行走摆动）
+  const legSwing = a.moving ? Math.sin(a.anim * 6) * 4 : 0;
+  ctx.fillStyle = '#3b2f22';
+  ctx.fillRect(x - 7 + legSwing, y + 4, 5, 10);
+  ctx.fillRect(x + 2 - legSwing, y + 4, 5, 10);
+  // 身体
+  ctx.fillStyle = isPlayer ? '#3b6ea5' : a.color;
+  ctx.fillRect(x - 9, y - 8, 18, 14);
+  if (!isPlayer) { ctx.fillStyle = '#e8d9b0'; ctx.fillRect(x - 9, y - 1, 18, 3); } // NPC 腰带
+  // 头
+  ctx.fillStyle = '#f2c79a';
+  ctx.beginPath(); ctx.arc(x, y - 13, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = isPlayer ? '#4a2f1b' : '#3a3a3a';
+  ctx.fillRect(x - 7, y - 20, 14, 5);   // 头发/帽子
+  // 眼睛（按朝向）
+  const f = isPlayer ? Player.facing : 'down';
+  if (f !== 'up') {
+    const ex = f === 'left' ? -3 : f === 'right' ? 3 : 0;
+    ctx.fillStyle = '#1c1c1c';
+    ctx.fillRect(x - 3 + ex, y - 13, 2, 3);
+    ctx.fillRect(x + 2 + ex, y - 13, 2, 3);
+  }
+  // NPC 名牌
+  if (!isPlayer) {
+    ctx.font = `12px ${FONT}`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    const w = ctx.measureText(a.name).width + 10;
+    ctx.fillRect(x - w / 2, y - 42, w, 16);
+    ctx.fillStyle = '#ffe9a8';
+    ctx.fillText(a.name, x, y - 30);
+  }
+}
+
+/* --- 道具（闪光星星） --- */
+function drawItem(it, time) {
+  if (!itemVisible(it)) return;
+  const p = Math.sin(time / 300) * 0.5 + 0.5;
+  ctx.save();
+  ctx.globalAlpha = 0.25 + p * 0.3;
+  ctx.fillStyle = '#ffe9a8';
+  ctx.beginPath(); ctx.arc(it.x, it.y, 10 + p * 4, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.translate(it.x, it.y);
+  ctx.rotate(time / 800);
+  ctx.fillStyle = '#fff3c4';
+  for (let i = 0; i < 4; i++) {
+    ctx.rotate(Math.PI / 2);
+    ctx.beginPath();
+    ctx.moveTo(0, -8); ctx.lineTo(3, 0); ctx.lineTo(0, 3); ctx.lineTo(-3, 0);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* --- 交互提示气泡 --- */
+function drawBubble(x, y, text, time) {
+  const bounce = Math.sin(time / 250) * 2;
+  ctx.font = `12px ${FONT}`;
+  const w = ctx.measureText(text).width + 16;
+  const bx = x - w / 2, by = y - 52 + bounce;
+  ctx.fillStyle = 'rgba(20,22,30,0.9)';
+  ctx.fillRect(bx, by, w, 22);
+  ctx.strokeStyle = '#f5c451'; ctx.lineWidth = 1;
+  ctx.strokeRect(bx + 0.5, by + 0.5, w - 1, 21);
+  ctx.fillStyle = '#ffe9a8'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, by + 11);
+}
+
+/* --- 世界绘制 --- */
+function drawWorld(time) {
+  ctx.save();
+  ctx.translate(-Math.round(Camera.x), -Math.round(Camera.y));
+  // 可见瓦片
+  const c0 = Math.max(0, Math.floor(Camera.x / TILE) - 1);
+  const c1 = Math.min(MAP_W - 1, Math.ceil((Camera.x + VIEW_W) / TILE) + 1);
+  const r0 = Math.max(0, Math.floor(Camera.y / TILE) - 1);
+  const r1 = Math.min(MAP_H - 1, Math.ceil((Camera.y + VIEW_H) / TILE) + 1);
+  for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) drawTile(c, r, TileMap.grid[r][c], time);
+  for (const it of ITEMS) drawItem(it, time);
+  // 实体按 y 排序绘制
+  const ents = [...NPCS.map(n => ({ a: n, player: false })), { a: Player, player: true }];
+  ents.sort((p, q) => p.a.y - q.a.y);
+  for (const e of ents) drawActor(e.a, e.player, time);
+  // 交互提示（仅探索态）
+  if (SM.state === 'EXPLORE') {
+    const hit = nearestInteractable();
+    if (hit) drawBubble(hit.obj.x, hit.obj.y, '按 E 交互', time);
+  }
+  ctx.restore();
+}
+
+/* --- HUD：目标横幅 + 提示 --- */
+function drawHUD(time) {
+  // 顶部目标横幅
+  const obj = HUD.objective();
+  ctx.font = `14px ${FONT}`;
+  const w = ctx.measureText(obj).width + 28;
+  ctx.fillStyle = 'rgba(12,14,20,0.72)';
+  ctx.fillRect((VIEW_W - w) / 2, 10, w, 28);
+  ctx.fillStyle = '#e8e6df'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(obj, VIEW_W / 2, 25);
+  // toast
+  HUD.toasts.forEach((s, i) => {
+    const tw = ctx.measureText(s.text).width + 24;
+    const y = 50 + i * 34;
+    ctx.globalAlpha = Math.min(1, s.t / 400);
+    ctx.fillStyle = 'rgba(12,14,20,0.85)';
+    ctx.fillRect((VIEW_W - tw) / 2, y, tw, 26);
+    ctx.fillStyle = '#ffe9a8';
+    ctx.fillText(s.text, VIEW_W / 2, y + 13);
+    ctx.globalAlpha = 1;
+  });
+  // 通关浮层
+  if (HUD.clearShown) {
+    ctx.fillStyle = 'rgba(8,10,16,0.55)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5c451';
+    ctx.font = `bold 34px ${FONT}`;
+    ctx.fillText('✦ 任务链全部完成 ✦', VIEW_W / 2, VIEW_H / 2 - 50);
+    ctx.fillStyle = '#e8e6df';
+    ctx.font = `18px ${FONT}`;
+    ctx.fillText('银之项链回到了村长手中，星语村又恢复了平静。', VIEW_W / 2, VIEW_H / 2);
+    ctx.fillText('感谢游玩！按 Esc 继续自由探索', VIEW_W / 2, VIEW_H / 2 + 34);
+  }
+}
+
+/* --- MENU：任务面板 --- */
+function drawMenuPanel() {
+  ctx.fillStyle = 'rgba(8,10,16,0.45)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const x = 40, y = 60, w = 320, h = 340;
+  ctx.fillStyle = 'rgba(14,16,24,0.95)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#f5c451'; ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#f5c451'; ctx.font = `bold 20px ${FONT}`;
+  ctx.fillText('任务面板', x + 20, y + 30);
+  let cy = y + 68;
+  for (const q of QUESTS) {
+    const s = QM.state(q.id);
+    ctx.fillStyle = QS_COLOR[s];
+    ctx.font = `bold 15px ${FONT}`;
+    ctx.fillText(`● ${q.name}`, x + 20, cy);
+    ctx.font = `13px ${FONT}`;
+    ctx.fillText(QS_LABEL[s], x + w - 78, cy);
+    ctx.fillStyle = '#9aa1b3';
+    ctx.fillText(q.desc, x + 34, cy + 20);
+    cy += 58;
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.beginPath(); ctx.moveTo(x + 16, y + h - 78); ctx.lineTo(x + w - 16, y + h - 78); ctx.stroke();
+  ctx.fillStyle = '#8b93a7'; ctx.font = `12px ${FONT}`;
+  ctx.fillText('Q / Esc 关闭面板 · R 重置进度', x + 20, y + h - 58);
+  ctx.fillText('WASD 移动 · E 交互', x + 20, y + h - 36);
+}
+
+/* --- DIALOG：JRPG 对话框 --- */
+function wrapText(text, maxW) {
+  const chars = [...text]; const lines = []; let cur = '';
+  for (const ch of chars) {
+    if (ctx.measureText(cur + ch).width > maxW && cur) { lines.push(cur); cur = ch; }
+    else cur += ch;
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+function drawDialog(time) {
+  if (!DM.active || !DM.def) return;
+  const x = 20, y = VIEW_H - 185, w = VIEW_W - 40, h = 165;
+  ctx.fillStyle = 'rgba(10,12,20,0.88)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = '#e8e6df'; ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  ctx.strokeStyle = '#f5c451'; ctx.lineWidth = 1;
+  ctx.strokeRect(x + 5, y + 5, w - 10, h - 10);
+  // 名牌
+  ctx.font = `bold 17px ${FONT}`;
+  const nw = ctx.measureText(DM.def.name).width + 20;
+  ctx.fillStyle = '#f5c451';
+  ctx.fillRect(x + 18, y - 14, nw, 26);
+  ctx.fillStyle = '#10131a'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(DM.def.name, x + 18 + nw / 2, y - 1);
+  // 正文（打字机）
+  const full = DM.curLine();
+  const shown = [...full].slice(0, Math.floor(DM.chars)).join('');
+  ctx.font = `20px ${FONT}`;
+  ctx.fillStyle = '#f2efe6'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  const lines = wrapText(shown, w - 60);
+  lines.slice(0, 3).forEach((ln, i) => ctx.fillText(ln, x + 30, y + 30 + i * 30));
+  // 选项
+  if (DM.selecting && DM.def.choices) {
+    ctx.font = `18px ${FONT}`;
+    DM.def.choices.forEach((c, i) => {
+      const cy = y + h - 76 + i * 30;
+      const selected = i === DM.sel;
+      ctx.fillStyle = selected ? '#ffe9a8' : '#b9bfce';
+      ctx.fillText(selected ? `▶ ${c.text}` : `   ${c.text}`, x + 60, cy);
+    });
+    ctx.font = `12px ${FONT}`;
+    ctx.fillStyle = '#8b93a7'; ctx.textAlign = 'right';
+    ctx.fillText('↑↓ 选择 · 回车确认', x + w - 22, y + h - 18);
+    return;
+  }
+  // 推进提示
+  const typing = DM.chars < [...full].length;
+  if (!typing && Math.sin(time / 250) > -0.3) {
+    ctx.fillStyle = '#f5c451'; ctx.textAlign = 'right';
+    ctx.font = `16px ${FONT}`;
+    ctx.fillText('▼', x + w - 24, y + h - 28);
+  }
+}
+
+/* --- TITLE：标题画面 --- */
+function drawTitle(time) {
+  const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  g.addColorStop(0, '#0b1026'); g.addColorStop(1, '#1c2748');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  // 星星
+  const rnd = mulberry32(42);
+  for (let i = 0; i < 90; i++) {
+    const x = rnd() * VIEW_W, y = rnd() * VIEW_H * 0.7;
+    const tw = Math.sin(time / 400 + i) * 0.5 + 0.5;
+    ctx.fillStyle = `rgba(255,255,240,${0.25 + tw * 0.6})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  // 月亮
+  ctx.fillStyle = '#f4ead0';
+  ctx.beginPath(); ctx.arc(VIEW_W - 130, 110, 42, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#0b1026';
+  ctx.beginPath(); ctx.arc(VIEW_W - 148, 98, 36, 0, Math.PI * 2); ctx.fill();
+  // 标题
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold 52px ${FONT}`;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillText('星语村物语', VIEW_W / 2 + 3, 203);
+  ctx.fillStyle = '#f5c451';       ctx.fillText('星语村物语', VIEW_W / 2, 200);
+  ctx.font = `18px ${FONT}`;
+  ctx.fillStyle = '#b9bfce';
+  ctx.fillText('经典 JRPG 风格 · 可交互演示', VIEW_W / 2, 248);
+  // 开始提示（闪烁）
+  if (Math.sin(time / 350) > -0.4) {
+    ctx.font = `bold 24px ${FONT}`;
+    ctx.fillStyle = '#e8e6df';
+    ctx.fillText('— 按任意键开始 —', VIEW_W / 2, 340);
+  }
+  // 操作说明
+  ctx.font = `14px ${FONT}`;
+  ctx.fillStyle = '#8b93a7';
+  ctx.fillText('WASD / 方向键 移动 · E 交互 · Q 任务面板', VIEW_W / 2, 400);
+  ctx.fillText('目标：帮村长找回丢失的银之项链', VIEW_W / 2, 426);
+  if (Game.hasSave()) {
+    ctx.fillStyle = '#5ab0f0';
+    ctx.fillText('检测到存档，按任意键继续 · 按 R 重新开始', VIEW_W / 2, 470);
+  }
+}
+
+/* =====================================================================
+ * 主循环
+ * ===================================================================== */
+function update(dt) {
+  HUD.update(dt);
+  switch (SM.state) {
+    case 'EXPLORE':
+      Player.update(dt);
+      Camera.update(dt);
+      Game.saveTimer += dt;
+      if (Game.saveTimer > 3000) { Game.saveTimer = 0; Game.save(); }
+      break;
+    case 'DIALOG':
+      DM.update(dt);      // 对话期间角色移动冻结
+      break;
+    case 'MENU':
+      /* 世界更新暂停 */
+      break;
+  }
+}
+function render(time) {
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  if (SM.state === 'TITLE') { drawTitle(time); return; }
+  drawWorld(time);
+  drawHUD(time);
+  if (SM.state === 'MENU') drawMenuPanel();
+  if (SM.state === 'DIALOG') drawDialog(time);
+}
+function loop(ts) {
+  if (!Game.last) Game.last = ts;
+  const dt = Math.min(50, ts - Game.last);   // dt 钳制，防后台切回穿模
+  Game.last = ts; Game.time = ts;
+  update(dt);
+  render(ts);
+  requestAnimationFrame(loop);
+}
+
+/* ---------------- 启动 ---------------- */
+function init() {
+  TileMap.init();
+  QM.init();
+  bindQuestEvents();
+  Game.load();
+  Camera.snap();
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  requestAnimationFrame(loop);
+}
+init();
+
+/* 自动化测试钩子（浏览器中无副作用） */
+window.__game = { Game, Bus, QM, Player, Camera, SM, DM, HUD, Input,
+  ITEMS, NPCS, TileMap, tryInteract, resetProgress };
+</script>
+</body>
+</html>
